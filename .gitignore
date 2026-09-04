@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+.DS_Store
+*.swp
+
+# Agent-to-agent scaffolding, not part of the shareable skill.
+HANDOFF.md
+
+# One-off probes that validated the approach. Their results are written up in
+# docs/findings.md; the scripts themselves are not worth shipping to users.
+experiments/
+
+# Never commit a credential. The real token lives in ~/.config/jira-search/token.
+token
+*.token

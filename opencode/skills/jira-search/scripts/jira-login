@@ -1,0 +1,37 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.9"
+# dependencies = []
+# ///
+"""jira-login — install your own Jira personal access token.
+
+Its own command rather than a flag on install.sh, because the two have
+different audiences: deploying the skill is a maintainer's job done once,
+installing a token is every user's own and cannot be done for them. It lives in
+the skill's scripts/ directory so it reaches users who were handed the deployed
+skill and never saw the source repo.
+
+The implementation stays in jqlsearch.py, which resolves the token path. Two
+copies of that resolution would drift, and then login would write where search
+does not read.
+
+  jira-login              prompt (hidden), write mode 600, verify
+  jira-login --from FILE  read the token from a file instead
+  jira-login --force      replace an existing token
+  jira-login --no-verify  skip the one live check
+
+A Jira PAT carries its owner's full permissions, write included, which is why
+this writes mode 600 and why nothing here ever echoes the token.
+"""
+import os
+import sys
+
+# Importing a sibling would drop __pycache__/ into the deployed skill directory,
+# which on a central deployment is shared and often not the caller's to write to.
+sys.dont_write_bytecode = True
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from jqlsearch import main  # noqa: E402
+
+if __name__ == "__main__":
+    sys.exit(main(["login"] + sys.argv[1:]))
