@@ -73,11 +73,27 @@ transitions, assigns, comments on, links, or deletes anything. The audit is one
 line:
 
 ```bash
-grep -nE 'method|POST|PUT|DELETE|PATCH' "$SKILL_DIR"/scripts/*
+grep -nE 'urlopen|Request\(|data=|method=|POST|PUT|DELETE|PATCH' "$SKILL_DIR"/scripts/*
 ```
 
-Two hits, both that one search call — the comment above it and the call itself.
-If you ever add a third, you have made this skill able to change Jira.
+**Four hits**, and every one of them has to be accountable:
+
+| What the line is | Why it is allowed |
+|---|---|
+| `req = urllib.request.Request(url, headers=self.headers())` | the GET builder — **no `data=`, no `method=`**, which is exactly what makes urllib send a GET |
+| `# POST /rest/api/2/search normally — …` | the comment above the search call |
+| `req = urllib.request.Request(…, data=body, method="POST", …)` | the one search call: Jira takes JQL in a request body |
+| `with urllib.request.urlopen(req, …) as r:` | the single place either request is actually sent |
+
+Do not settle for the narrower `grep -nE 'method|POST|PUT|DELETE|PATCH'`. It
+finds only the last two, and it would **miss a future
+`urllib.request.Request(url, data=payload)`** — urllib makes any request that
+carries a body a POST whether or not anyone wrote `method=`. That is precisely
+the change that would quietly give this skill the ability to write, so `data=`,
+`Request(` and `urlopen` are in the pattern on purpose.
+
+If a fifth hit appears, or the GET builder above ever grows a `data=`, this skill
+can change Jira.
 
 ### Never announce a missing token you have not observed
 
@@ -99,7 +115,13 @@ Cong Wang <cwang31@slac.stanford.edu>
   instance: https://jira.slac.stanford.edu
   account:  cwang31@slac.stanford.edu (key JIRAUSER21902)
   token:    /home/exedev/.config/jira-search/token
+  note:     search results are filtered by your own permissions —
+            another account sees a different set of projects.
+  note:     a Jira PAT carries this account's FULL permissions,
+            including write. This tool only ever reads.
 ```
+
+The two `note:` blocks are part of the output, not commentary added here.
 
 A name and email means auth is fine — proceed with the real query. Only if a
 command exits with an error mentioning the token do the following apply.
@@ -146,6 +168,23 @@ passes through you or through a command line.
 
 `text` and `search` share `--limit N` (default 25, `0` = no cap), `--start N`,
 `--all`, `--json`, `--fields CSV`, and `--excerpt`.
+
+### `-v` — see what the network is doing
+
+`-v` / `--verbose` works on **every** subcommand and writes to **stderr** only:
+the rate-limit budget left after each response, and a line for each 429 backoff
+while it waits. Nothing on stdout changes, so adding it never disturbs a pipe or
+`--json`.
+
+```bash
+uv run --script "$JQL" -v text "epixuhr" --limit 1     # before the subcommand
+uv run --script "$JQL" text "epixuhr" -v --limit 1     # after it — also works
+```
+
+Both positions are accepted. `-v` is how you see the whole rate-limit story
+described under **Rules** below — every 429 sleep, however short. Without it,
+only sleeps of 30 s or more announce themselves, so a *long* wait is never
+mistaken for a hang, but a run of short ones is still invisible.
 
 ### text — the common case
 
@@ -284,8 +323,14 @@ XROBCS           software     LCLS X-Ray Optics 5kW BCS
   differ per project (`To Do`, `Backlog`, `In Preparation`, `Stalled`, ...).
   `text --open` writes that clause for you.
 - **Rate limits are real**: 70 requests of burst, refilling 5/s. The script backs
-  off on HTTP 429 and honours `Retry-After` — don't wrap it in a tight loop, and
-  prefer one `--limit 100` call over 100 calls.
+  off on HTTP 429 — don't wrap it in a tight loop, and prefer one `--limit 100`
+  call over 100 calls. Short backoffs are invisible unless you pass `-v`, so a
+  command that seems to hang is often sleeping off a 429; any sleep of 30 s or
+  more says so on stderr with or without `-v`. Total backoff for one command is
+  capped at 10 minutes (`RETRY_BUDGET`), after which it gives up and tells you
+  how long it waited rather than stalling an `--all` sweep for hours. This
+  instance sends `Retry-After: 0`, which is **not** obeyed literally — see
+  `docs/findings.md`.
 - **A 200 response is not proof of auth.** A bad Bearer gets Jira's anonymous
   view, not an error; the script checks `X-AUSERNAME` on every response and
   fails loudly instead of quietly showing you a stranger's smaller Jira.

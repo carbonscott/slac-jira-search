@@ -166,6 +166,104 @@ trip can drain it. To actually trip this you need concurrency, not a loop.
 A client that reads its budget from the headers must cope with their absence, not
 assume "no header means no limit".
 
+### What a real 429 from this instance actually looks like
+
+Provoked with **200 concurrent GETs** (90 answered 200, 110 answered 429). A
+serial burst cannot do it: the bucket holds 70 and refills at 5/s, so a loop on a
+~130 ms round trip drains it slower than it fills. You need parallelism.
+
+The response is **not JSON.** Tomcat answers it ahead of the application, with an
+HTML status page:
+
+```
+HTTP/1.1 429
+Retry-After: 0
+X-RateLimit-Remaining: 0
+X-RateLimit-Limit: 70
+Content-Type: text/html;charset=utf-8
+
+<!doctype html><html lang="en"><head><title>HTTP Status 429 – Too Many
+Requests</title><style type="text/css">body {font-family:Tahoma,Arial,…}…</style>
+</head><body><h1>HTTP Status 429 – Too Many Requests</h1><hr class="line" />
+<p><b>Type</b> Status Report</p>…<h3>Apache Tomcat/9.0.107</h3></body></html>
+```
+
+Two consequences for any client:
+
+**1. The error extractor must not assume JSON.** Every *Jira* error is JSON, so
+it is easy to write `json.loads(body)` with a `body[:300]` fallback — and then
+the one error you most want to read prints 300 characters of stylesheet with the
+message still off the end. `jqlsearch.py` pulls the `<title>`/`<h1>` out of an
+HTML body (and `<message>` out of the XML the PAT endpoint returns), so a spent
+429 now reads:
+
+```
+error: HTTP 429 — Jira is rate-limiting this client, and 5 attempts did not get through.
+  server said:  HTTP Status 429 – Too Many Requests
+  headers:      Retry-After: 0  |  X-RateLimit-Remaining: 0
+  what to do:   wait a minute, then run fewer calls in parallel — one --limit 100 beats 100 calls.
+  note:         a `Retry-After` of 0 — which this instance sends, on 429s and on healthy responses alike — is not an instruction to retry at once. Unusable values are ignored and this client backs off on its own schedule.
+```
+
+(That is verbatim, produced against a local mock replaying this instance's 429.
+The last line is one long line in the real output.)
+
+**2. `Retry-After: 0` must not be obeyed literally.** It is sent on the 429 as
+well as on healthy responses, and taking it at face value means retrying
+instantly against a server that has just said stop — a hot loop, and the fastest
+way to stay rate-limited. `jqlsearch.py` treats `0` (and a missing header) as
+"use my own schedule" and backs off **10 s, 20 s, 40 s, 80 s** over five
+attempts, doubling each time — measured, not intended: the sleeps recorded from
+the run above are `[10.0, 20.0, 40.0, 80.0]`.
+
+A `Retry-After` that parses to a positive number *is* honoured, capped at
+`MAX_RETRY_WAIT = 300 s`. That cap is per **sleep**, and on its own it bounds far
+less than it sounds like it does: `delay` is re-armed for every request, and each
+of the four sleeps within a request is clamped separately. So the honest worst
+case is not 300 s, it is this — measured against a local always-429 mock with the
+sleeps virtualised, one process, sequential requests:
+
+| `Retry-After` | sleeps | one request | `--limit 0 --all`, `issuetype = Bug` (13 requests) | `--limit 0 --all`, whole instance (55 requests) |
+|---|---|---|---|---|
+| absent, `0`, or junk | `[10, 20, 40, 80]` | 150 s | 32.5 min | 2.3 h |
+| huge, or `inf` | `[300, 300, 300, 300]` | **1200 s = 20 min** | **4.3 h** | **18.3 h** |
+
+Those two sweeps are the ones SKILL.md documents as ordinary use, and until this
+was fixed nothing at all was printed on stderr during any of it unless `-v` was
+given — a silent twenty-minute pause an agent cannot tell apart from a hang.
+
+Two changes close that, and `MAX_RETRY_WAIT` is neither of them:
+
+- **`RETRY_BUDGET = 600 s`** is a whole-**command** budget, not a per-request one:
+  a module-level counter of seconds actually spent asleep in the retry path, which
+  the retry loop consults before every sleep. When it is gone the client stops and
+  says how long it waited. Same mock, same `Retry-After: inf`: **1200 s per
+  request → 600 s for the whole run**, whether the run is 1 request, 13, or 55.
+  It counts sleeping only, never wall clock, so a slow-but-healthy sweep is never
+  cut short by it.
+- **`LOUD_SLEEP = 30 s`** — any sleep at least that long now prints on stderr
+  **with or without `-v`**:
+  `  (429 rate limited, sleeping 300s; 300s of the 600s retry budget used)`
+
+Everything unusable falls back to the doubling schedule rather than raising —
+which matters, because the header has two legal forms and only one is a number:
+
+| `Retry-After` | wait, with a 10 s fallback |
+|---|---|
+| absent / `""` | 10 s |
+| `0`, `-5` | 10 s — this instance's value |
+| `30`, `30.5` | 30 s, 30.5 s |
+| `Wed, 21 Oct 2015 07:28:00 GMT` (past) | 10 s |
+| an HTTP-date ~45 s out | 44.2 s |
+| `Fri, 01 Jan 2100 00:00:00 GMT` | 300 s (clamped) |
+| `soon-ish`, `nan`, malformed date | 10 s |
+| `inf` | 300 s (clamped) |
+
+Jira DC sends an integer today, so the HTTP-date row never fires against this
+instance — but a proxy or CDN in front of it is free to send it, and a bare
+`float()` on that string raises `ValueError` **inside the retry path**, turning a
+recoverable rate-limit into a crash.
+
 *Deliberate comparison, since this repo mirrors `slac-confluence-search`:* the
 Confluence instance behaved completely differently — sustained ~3 s-spaced
 requests tripped `HTTP 429` after roughly ten calls and stayed tripped through a
@@ -259,8 +357,38 @@ The PAT page itself is a profile tab, not a plugin URL:
 
 Signed out, that URL **redirects rather than 404s** — `302` to
 `/login.jsp?permissionViolation=true&os_destination=…`, verified with a
-cookieless `curl`. Useful when someone reports "your link is broken": a 302 to
-`login.jsp` means the link is fine and they are not signed in.
+cookieless `curl`. That is worth knowing (the link is live, not dead, and
+`os_destination` brings you back after login) but it proves **nothing about
+whether the URL is correct**, and an earlier draft of this file claimed it did.
+
+Signed out, this instance 302s to `login.jsp` for *anything* under `/secure/`.
+Verified 2026-09-04, same cookieless `curl`, all four → `302 login.jsp`:
+
+```
+/secure/ViewProfile.jspa?selectedTab=com.atlassian.pats.pats-plugin:jira-user-personal-access-tokens
+/secure/ViewProfile.jspa?selectedTab=com.bogus.plugin:nonexistent-tab
+/secure/NoSuchPage.jspa
+/secure/TotalGarbage12345.jspa?selectedTab=lol
+```
+
+Jira applies the permission check before the does-this-page-exist check, so the
+redirect is its answer to every anonymous request. It even does it under
+`/rest/`: `GET /rest/nosuchplugin/latest/tokens` **with a valid Bearer** is also
+a `302` to `login.jsp`, not a 404.
+
+So "302 to login.jsp" means *only* "you are not signed in / this is not
+recognised". The check with real discriminating power is the PAT endpoint above:
+
+```
+GET /rest/pat/latest/tokens   no Bearer       -> HTTP 401 {"status-code":401,"message":"Client must be authenticated…"}
+GET /rest/pat/latest/tokens   valid Bearer    -> HTTP 200 [{"id":58,"name":"test","createdAt":…,"expiringAt":…,"lastAccessedAt":…}]
+GET /rest/nosuchplugin/latest/tokens  valid   -> HTTP 302 login.jsp
+```
+
+401 / 200 / 302 are three distinguishable answers, and the `200` is what proves
+the PAT plugin is installed — which is the claim the `selectedTab` key depends
+on. Response fields are `id`, `name`, `createdAt`, `expiringAt`,
+`lastAccessedAt`; **no secret values**.
 
 The API can list and create tokens, but only for a caller who already holds one,
 so **the first token has to come from a browser.** There is no bootstrap.

@@ -29,7 +29,9 @@ over scripts/ for write-shaped verbs is the audit that keeps it that way.
 from __future__ import annotations
 
 import argparse
+import atexit
 import getpass
+import html
 import json
 import os
 import re
@@ -39,6 +41,8 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 
 try:
     import pwd                      # unix only; absent on Windows
@@ -58,13 +62,24 @@ PAT_URL = (f"{BASE}/secure/ViewProfile.jspa?selectedTab="
 # lives in the repo, and a user of a central deployment has only the deployed
 # skill directory (SKILL.md, reference/, scripts/). Absolute, so the hint stays
 # correct after the reader cd's somewhere else.
-SELF = os.path.abspath(sys.argv[0]) if sys.argv and sys.argv[0] else "jqlsearch.py"
+#
+# __file__, deliberately, and NOT sys.argv[0]: the sibling `jira-login` wrapper
+# imports this module and calls main(["login"] + argv), so under it argv[0] is
+# the wrapper. A hint built from argv[0] then reads `jira-login whoami`, and the
+# wrapper has already spent the subcommand slot on "login" — that command dies
+# with `unrecognized arguments: whoami`. So: any hint that names a SUBCOMMAND
+# must name jqlsearch.py, whichever entry point the user actually came in
+# through. A hint with no subcommand after it has no such constraint and is free
+# to name the friendlier wrapper — LOGIN_CMD, three lines down, is exactly that
+# case and does.
+SCRIPT = os.path.abspath(__file__) if "__file__" in globals() else "jqlsearch.py"
 
 # The command to hand a user who needs a token. `jira-login` is a sibling
 # wrapper shipped in the same scripts/ directory; fall back to the subcommand
-# when jqlsearch.py was copied somewhere on its own.
-_WRAPPER = os.path.join(os.path.dirname(SELF), "jira-login")
-LOGIN_CMD = _WRAPPER if os.path.exists(_WRAPPER) else f"{SELF} login"
+# when jqlsearch.py was copied somewhere on its own. This one is a bare command
+# with no subcommand after it, so the wrapper is the right thing to name.
+_WRAPPER = os.path.join(os.path.dirname(SCRIPT), "jira-login")
+LOGIN_CMD = _WRAPPER if os.path.exists(_WRAPPER) else f"{SCRIPT} login"
 
 
 def home_dir() -> str:
@@ -103,6 +118,20 @@ CA_CANDIDATES = ("/etc/pki/tls/certs/ca-bundle.crt",
 
 MAX_LIMIT = 1000         # server hard cap: asking for 5000 comes back as 1000
 PAGE_DELAY = 0.5         # between pages of an --all sweep; FillRate is 5/s
+MAX_RETRY_WAIT = 300.0   # cap on ONE 429 sleep, whatever Retry-After claims
+
+# ...and a cap on all of them together, because MAX_RETRY_WAIT on its own bounds
+# nothing an agent cares about. `delay` is re-armed for every request and each of
+# the four sleeps in a request is clamped separately, so a `Retry-After` of "inf"
+# costs 4 x 300 s = 20 minutes PER REQUEST — and SKILL.md documents `--limit 1200
+# --all` and `--limit 0 --all` as ordinary use: 13 requests for issuetype = Bug is
+# 4.3 hours, 55 requests for the whole instance is 18.3 hours, all of it silent
+# without -v. RETRY_BUDGET is what actually stops that. It counts only seconds
+# spent asleep in the retry path, never wall clock, so a slow-but-healthy sweep is
+# never cut short by it; raise it if you genuinely want to wait longer.
+RETRY_BUDGET = 600.0     # total 429 backoff allowed for the WHOLE command
+LOUD_SLEEP = 30.0        # a sleep at least this long is announced without -v
+_retry_slept = 0.0       # seconds this process has already spent backing off
 
 # Enough to render a hit line, and cheap enough that --limit 1000 stays one
 # fast call. Jira search has no `excerpt` field, so there is nothing to show
@@ -199,6 +228,92 @@ error: Jira answered as ANONYMOUS (X-AUSERNAME: anonymous) — the token was not
   then install it: {LOGIN_CMD} --force"""
 
 
+def retry_after_seconds(value, fallback: float) -> float:
+    """How long to wait, from a `Retry-After` that may be anything at all.
+
+    RFC 9110 permits two forms — delta-seconds (`120`) and an HTTP-date
+    (`Wed, 21 Oct 2015 07:28:00 GMT`) — and a bare float() on the second raises
+    ValueError. Jira DC sends an integer today, so this never fired here, but a
+    proxy or CDN in front of the instance is free to send the date form, and a
+    traceback inside the retry path would turn a recoverable rate-limit into a
+    crash at exactly the moment the tool is supposed to be coping.
+
+    Nothing here is trusted; anything unusable falls back to the caller's own
+    backoff schedule:
+
+      missing / empty / unparseable   -> fallback
+      "0", negative, or NaN           -> fallback  (this instance sends 0)
+      "30"                            -> 30.0
+      b"30"                           -> 30.0      (decoded, not stringified)
+      "1_0"                           -> fallback  (float() would say 10.0)
+      "0x10", "soon-ish"              -> fallback
+      an HTTP-date in the future      -> seconds until then
+      an HTTP-date already past       -> fallback
+      absurdly large, or "inf"        -> clamped to MAX_RETRY_WAIT
+    """
+    if value is None:
+        return fallback
+    if isinstance(value, (bytes, bytearray)):
+        # http.client hands headers back as str, but this function is also
+        # called with whatever a caller has; str(b"30") is "b'30'", which parses
+        # as nothing and would degrade to the fallback while looking handled.
+        try:
+            value = bytes(value).decode("latin-1")   # the header charset
+        except (UnicodeDecodeError, ValueError):     # pragma: no cover
+            return fallback
+    raw = str(value).strip()
+    if not raw:
+        return fallback
+    if "_" in raw:
+        # float() honours PEP 515 underscores, so a header of "1_0" would be
+        # read as 10 seconds. Retry-After has no such form — delta-seconds is
+        # DIGITs — and an HTTP-date has no underscore either, so this is junk.
+        return fallback
+    try:
+        secs = float(raw)
+    except ValueError:
+        try:
+            when = parsedate_to_datetime(raw)
+        except (TypeError, ValueError, OverflowError):
+            return fallback
+        if when is None:                     # older pythons answer None, not raise
+            return fallback
+        if when.tzinfo is None:              # a date with no zone means UTC here
+            when = when.replace(tzinfo=timezone.utc)
+        try:
+            secs = (when - datetime.now(timezone.utc)).total_seconds()
+        except (OverflowError, ValueError):  # pragma: no cover
+            return fallback
+    if secs != secs or secs <= 0:            # NaN, zero, or in the past
+        return fallback
+    return min(secs, MAX_RETRY_WAIT)
+
+
+def budget_spent_message(spent: float, headers, body: str) -> str:
+    """What to say when the whole-command 429 budget is gone.
+
+    Names the time actually waited, because the alternative an agent is left
+    with is guessing whether the tool hung.
+    """
+    return (f"error: HTTP 429 — Jira kept rate-limiting this client and the "
+            f"whole-command retry budget is spent: {spent:.0f}s "
+            f"({spent / 60:.1f} min) asleep across this run, out of "
+            f"{RETRY_BUDGET:.0f}s. Giving up rather than waiting longer.\n"
+            f"  server said:  {extract_message(body)}\n"
+            f"  headers:      Retry-After: {headers.get('Retry-After')}  |  "
+            f"X-RateLimit-Remaining: {headers.get('X-RateLimit-Remaining')}\n"
+            f"  what to do:   wait a few minutes, then run fewer calls in "
+            f"parallel — one --limit 100 beats 100 calls. Something that ran "
+            f"out of budget here was being throttled the whole way; restarting "
+            f"it immediately will not go faster.\n"
+            f"  note:         this budget covers the whole command, not one "
+            f"request. A `Retry-After` of 'inf' or a huge number would "
+            f"otherwise buy 20 minutes per request, and an --all sweep is "
+            f"dozens of requests. Raise RETRY_BUDGET in\n"
+            f"                {SCRIPT}\n"
+            f"                if waiting longer is really what you want.")
+
+
 class Client:
     """Thin read-only client with 429 backoff. The SLAC instance rate-limits.
 
@@ -251,6 +366,29 @@ class Client:
                                          {"Content-Type": "application/json"}))
         return self._send(req, f"{API}/search", tries)
 
+    def log_rate(self, headers) -> None:
+        """The rate-limit budget on stderr, from whatever headers arrived.
+
+        Every piece is optional. `/rest/api/2/serverInfo` sends none of these at
+        all, and a proxy is free to forward some and drop others, so the line is
+        assembled from what is actually present instead of being formatted
+        blind — the old version printed `69 of None left, refills None/Nones`
+        the moment anything was missing, which reads like a bug in the client
+        rather than a quiet endpoint.
+        """
+        rem = headers.get("X-RateLimit-Remaining")
+        if rem is None:                      # nothing useful to say
+            return
+        limit = headers.get("X-RateLimit-Limit")
+        fill = headers.get("X-RateLimit-FillRate")
+        interval = headers.get("X-RateLimit-Interval-Seconds")
+        budget = f"{rem} of {limit} left" if limit is not None else f"{rem} left"
+        if fill is not None and interval is not None:
+            budget += f", refills {fill}/{interval}s"
+        elif fill is not None:
+            budget += f", refills {fill} per interval"
+        print(f"  (rate limit: {budget})", file=sys.stderr)
+
     def _send(self, req, path: str, tries: int = 5) -> object:
         """Send a prepared request, honour 429, and turn Jira errors into text.
 
@@ -258,6 +396,13 @@ class Client:
         Returns whatever the endpoint answers: /rest/api/2/project is a bare
         JSON array, everything else here is an object.
         """
+        global _retry_slept
+        # At least one attempt, always. The loop below has no normal exit — every
+        # path inside it returns or exits — so this clamp is what makes that true
+        # rather than nearly true, and it is why there is no "retries exhausted"
+        # line after the loop: with tries >= 1 that line was unreachable, and
+        # with tries = 0 it was the only thing a caller got instead of a request.
+        tries = max(1, int(tries))
         delay = 10.0
         for attempt in range(tries):
             try:
@@ -270,26 +415,39 @@ class Client:
                     if who == "anonymous":
                         sys.exit(AUTH_FAIL.format(src=token_source()))
                     if self.verbose:
-                        rem = r.headers.get("X-RateLimit-Remaining")
-                        if rem is not None:
-                            print(f"  (rate limit: {rem} of "
-                                  f"{r.headers.get('X-RateLimit-Limit')} left, "
-                                  f"refills {r.headers.get('X-RateLimit-FillRate')}"
-                                  f"/{r.headers.get('X-RateLimit-Interval-Seconds')}s)",
-                                  file=sys.stderr)
+                        self.log_rate(r.headers)
                     raw = r.read().decode("utf-8", "replace")
                     return json.loads(raw) if raw.strip() else {}
             except urllib.error.HTTPError as e:
                 body = e.read().decode("utf-8", "replace")
                 if e.code == 429 and attempt < tries - 1:
-                    # `or delay` twice on purpose: this instance sends
-                    # `Retry-After: 0`, and honouring that literally is a hot
-                    # loop against a server that is already saying stop.
-                    wait = float(e.headers.get("Retry-After") or delay) or delay
-                    if self.verbose:
-                        print(f"  (429 rate limited, sleeping {wait:.0f}s)",
+                    # This instance sends `Retry-After: 0`, and honouring that
+                    # literally is a hot loop against a server that is already
+                    # saying stop — so 0, junk and a missing header all fall
+                    # back to the doubling schedule. See retry_after_seconds().
+                    wait = retry_after_seconds(e.headers.get("Retry-After"),
+                                               delay)
+                    # The whole-command budget, consulted here and nowhere else.
+                    # Without it MAX_RETRY_WAIT bounds one sleep and nothing
+                    # else: `delay` resets per request, so a pathological header
+                    # scales straight up with the number of requests a sweep
+                    # makes. See RETRY_BUDGET.
+                    left = RETRY_BUDGET - _retry_slept
+                    if left <= 0:
+                        sys.exit(budget_spent_message(_retry_slept, e.headers,
+                                                      body))
+                    wait = min(wait, left)
+                    # Loud even without -v once the pause is long. A silent
+                    # multi-minute stall is indistinguishable from a hang, and
+                    # an agent watching it will kill the command rather than
+                    # wait — which is the wrong lesson to teach it.
+                    if self.verbose or wait >= LOUD_SLEEP:
+                        print(f"  (429 rate limited, sleeping {wait:.0f}s; "
+                              f"{_retry_slept + wait:.0f}s of the "
+                              f"{RETRY_BUDGET:.0f}s retry budget used)",
                               file=sys.stderr)
                     time.sleep(wait)
+                    _retry_slept += wait
                     delay *= 2
                     continue
                 if e.code == 400:
@@ -304,11 +462,113 @@ class Client:
                 if e.code == 404:
                     sys.exit(f"error: HTTP 404 for {path} — "
                              f"{extract_message(body)}")
+                if e.code == 429:
+                    # Retries are spent. Say what happened in words, because the
+                    # body here is a Tomcat HTML page, not Jira JSON, and the
+                    # generic line below would print a paragraph of stylesheet.
+                    plural = "attempt" if tries == 1 else "attempts"
+                    sys.exit(f"error: HTTP 429 — Jira is rate-limiting this "
+                             f"client, and {tries} {plural} did not get "
+                             f"through.\n"
+                             f"  server said:  {extract_message(body)}\n"
+                             f"  headers:      Retry-After: "
+                             f"{e.headers.get('Retry-After')}  |  "
+                             f"X-RateLimit-Remaining: "
+                             f"{e.headers.get('X-RateLimit-Remaining')}\n"
+                             f"  what to do:   wait a minute, then run fewer "
+                             f"calls in parallel — one --limit 100 beats 100 "
+                             f"calls.\n"
+                             f"  note:         a `Retry-After` of 0 — which "
+                             f"this instance sends, on 429s and on healthy "
+                             f"responses alike — is not an instruction to "
+                             f"retry at once. Unusable values are ignored and "
+                             f"this client backs off on its own schedule.")
                 sys.exit(f"HTTP {e.code} for {path}: {extract_message(body)}")
             except urllib.error.URLError as e:
                 sys.exit(f"network/TLS error for {path}: {e.reason}\n"
                          f"hint: export SSL_CERT_FILE=/etc/pki/tls/certs/ca-bundle.crt")
-        sys.exit("error: retries exhausted (rate limited)")
+
+
+_TAG_RE = re.compile(r"<[^>]+>")
+
+# How much of a non-JSON error body is worth reading at all. This is the *error*
+# path: it runs when the server is already misbehaving, on a body nobody vetted,
+# so the work done here must not scale with whatever the other end felt like
+# sending. A <title>, an <h1> and an XML <message> all sit in the first few
+# hundred bytes of any page that has one, so 8 KB is already far more than a
+# message needs. Applied BEFORE anything scans the body — belt to _ELEMENT's
+# braces, and it also bounds the tag-strip and unescape passes below.
+_MARKUP_SCAN = 8192
+
+# How much of the extracted sentence to keep. 300, which is what this code gave
+# before the error-parser was added, and dropping it to 200 was an accident of
+# that rewrite rather than a decision. The parser exists because 300 characters
+# of *raw body* was a screenful of stylesheet with the message still off the end
+# — not because 300 characters of the actual message is too many.
+_MSG_CLIP = 300
+
+# The opening tag only. The closing tag is found with str.find, not with a
+# regex — see _element_text(), where that split is the entire point.
+_OPEN_RE = {t: re.compile(rf"<{t}[^>]*>", re.I) for t in ("title", "h1", "message")}
+
+
+def _element_text(body: str, tag: str):
+    """Inner text of the first <tag ...>...</tag>, or None. Linear in len(body).
+
+    Deliberately NOT `<tag[^>]*>(.*?)</tag>` with re.S. That pattern is
+    catastrophic on the one input this function has to survive — an error body
+    carrying many OPENING tags and no closing one — because `.*?` rescans to
+    end-of-body from every opener in turn: O(n^2). Measured on the previous
+    version: 500 bare <title>s in a 99 KB body took 0.77 s, 4000 took 5.8 s,
+    20000 in 232 KB took 44.7 s, all on the error path, all on a body chosen by
+    whoever is misbehaving.
+
+    Unrolling the inner class (`[^<]*(?:<(?!/title)[^<]*)*`) does NOT fix it,
+    which is worth writing down because it looks like it should: the negative
+    lookahead only refuses `</title`, so the group walks straight over every
+    other `<title>` to the end of the body exactly as `.*?` did — remeasured at
+    193 ms for 1168 openers in 8 KB. Finding the CLOSING tag first does fix it,
+    because str.find scans forward from a cursor that never rewinds: no closing
+    tag means no match, found in one pass, with nothing to backtrack into.
+    """
+    low = body.lower()
+    close = "</" + tag
+    start = 0
+    while True:
+        c = low.find(close, start)
+        if c < 0:                            # no closer left: nothing can match
+            return None
+        m = _OPEN_RE[tag].search(body, start, c)
+        if m:
+            return body[m.end():c]
+        start = c + len(close)               # a closer with no opener; keep going
+
+
+def markup_message(body: str) -> str:
+    """A readable sentence out of an error body that is not JSON.
+
+    Jira's own errors are JSON, but not every error on this path comes from
+    Jira. A 429 is answered by Tomcat *before* the application is reached, as an
+    HTML status page; the PAT endpoint answers an unauthenticated call in XML.
+    Collapsing either one and clipping to 300 characters yields a screenful of
+    stylesheet with the actual message still off the end, so pull out the
+    elements that carry the text: <title>/<h1> for HTML, <message> for XML.
+
+    An empty or whitespace-only <title> falls through to <h1>, which is what
+    Tomcat's 429 page needs: its <title> is the status line, its <h1> is the
+    sentence. Nested markup inside the element is stripped, not skipped.
+    """
+    body = (body or "")[:_MARKUP_SCAN]
+    for tag in ("title", "h1", "message"):
+        inner = _element_text(body, tag)
+        if inner is not None:
+            out = collapse(html.unescape(_TAG_RE.sub(" ", inner)), _MSG_CLIP)
+            if out:
+                return out
+    if "<" in body and ">" in body:          # some other markup — strip the tags
+        return (collapse(html.unescape(_TAG_RE.sub(" ", body)), _MSG_CLIP)
+                or "(markup response with no readable text)")
+    return collapse(body, _MSG_CLIP) or "(empty response body)"
 
 
 def extract_message(body: str) -> str:
@@ -316,12 +576,13 @@ def extract_message(body: str) -> str:
 
     Jira uses two shapes and a blind `.get("message")` misses the important
     one: 400/404 carry {"errorMessages": [...], "errors": {...}} while 401
-    carries {"message": "...", "status-code": 401}.
+    carries {"message": "...", "status-code": 401}. A body that is not JSON at
+    all is a third case — see markup_message().
     """
     try:
         d = json.loads(body)
     except Exception:  # noqa: BLE001
-        return " ".join(body.split())[:300]
+        return markup_message(body or "")
     if isinstance(d, dict):
         parts = [str(m) for m in (d.get("errorMessages") or []) if m]
         parts += [f"{k}: {v}" for k, v in (d.get("errors") or {}).items()]
@@ -329,7 +590,7 @@ def extract_message(body: str) -> str:
             return "  ".join(parts)
         if d.get("message"):
             return str(d["message"])
-    return " ".join(body.split())[:300]
+    return collapse(body, _MSG_CLIP) or "(empty response body)"
 
 
 # --------------------------------------------------------------------------
@@ -430,7 +691,7 @@ def cmd_login(args) -> int:
         print(f"\nwarning: {TOKEN_FILE} was written, but the check above failed.\n"
               f"         The token may be wrong (a truncated paste is the usual\n"
               f"         cause) — or this instance rate-limited the check; it\n"
-              f"         does that readily. Try `{SELF} whoami` in a minute.",
+              f"         does that readily. Try `{SCRIPT} whoami` in a minute.",
               file=sys.stderr)
         return 1
     print()
@@ -674,7 +935,7 @@ def parse_issue_key(target: str) -> str:
     sys.exit(f"error: {target!r} is not an issue key or issue URL.\n"
              f"  expected PROJECT-123, {BASE}/browse/PROJECT-123,\n"
              f"  or a board URL containing ?selectedIssue=PROJECT-123.\n"
-             f"  to search by words instead: {SELF} text \"{target}\"")
+             f"  to search by words instead: {SCRIPT} text \"{target}\"")
 
 
 def stamp(ts: str) -> str:
@@ -771,7 +1032,10 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="jqlsearch",
         description="Query SLAC Jira live via the JQL search API (read-only).")
-    p.add_argument("-v", "--verbose", action="store_true")
+    p.add_argument("-v", "--verbose", action="store_true",
+                   help="progress on stderr: rate-limit headers per response "
+                        "and every 429 backoff. Accepted before or after the "
+                        "subcommand.")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     def add_search_flags(sp):
@@ -850,12 +1114,89 @@ def build_parser() -> argparse.ArgumentParser:
     pr.add_argument("--json", action="store_true", help="raw JSON")
     pr.set_defaults(func=cmd_projects)
 
+    # -v is a top-level flag, but `text timing -v` is what a person actually
+    # types, and argparse answers that with `unrecognized arguments: -v`. Give
+    # every subcommand its own copy so both positions work.
+    #
+    # default=argparse.SUPPRESS is load-bearing. Since Python 3.7 a subparser
+    # parses into a *fresh* namespace and copies every key it holds back over
+    # the parent's, so a plain `default=False` here would silently undo the True
+    # that `jqlsearch.py -v text timing` had already set. SUPPRESS leaves the
+    # key absent unless the flag was actually given, so the parent's value
+    # survives and either position — or both — turns verbosity on.
+    for sp in sub.choices.values():
+        sp.add_argument("-v", "--verbose", action="store_true",
+                        default=argparse.SUPPRESS,
+                        help="progress and rate-limit headers on stderr")
+
     return p
 
 
+def _devnull_stdout() -> None:
+    """Point fd 1 at /dev/null. Called once a write to stdout has already failed.
+
+    Python flushes sys.stdout during interpreter shutdown, and a flush to a pipe
+    whose reader has gone prints `Exception ignored in: <_io.TextIOWrapper
+    name='<stdout>'>` *after* the program has otherwise finished — the exact
+    noise all of this exists to suppress. Redirecting the fd gives that flush
+    somewhere harmless to land.
+
+    os.open() returns a descriptor of its own and os.dup2() only duplicates it
+    onto fd 1, so the original is spare and is closed here rather than leaked.
+    """
+    try:
+        fd = os.open(os.devnull, os.O_WRONLY)
+    except OSError:                                    # pragma: no cover
+        return
+    try:
+        os.dup2(fd, sys.stdout.fileno())
+    except OSError:                                    # pragma: no cover
+        pass
+    finally:
+        os.close(fd)
+
+
+def _flush_stdout_quietly() -> None:
+    """Flush stdout at exit, and swallow the broken pipe if there is one.
+
+    Registered with atexit, which runs before the interpreter's own flush of the
+    standard streams. That ordering is what makes this cover the paths main()
+    cannot: `--help` prints and then raises SystemExit from inside argparse, and
+    every sys.exit("error: ...") in this file leaves buffered stdout behind the
+    same way.
+    """
+    try:
+        sys.stdout.flush()
+    except (BrokenPipeError, ValueError, OSError):
+        _devnull_stdout()
+
+
+atexit.register(_flush_stdout_quietly)
+
+
 def main(argv=None) -> int:
-    args = build_parser().parse_args(argv)
-    return args.func(args)
+    # `projects | head -1` and `text foo | grep bar` are how this tool is
+    # actually used, and the reader exits first every time. Python's default
+    # turns the resulting EPIPE into a BrokenPipeError traceback *and* a second
+    # complaint when the interpreter flushes stdout on the way out — eight lines
+    # of noise and a non-zero exit for something that is not an error.
+    #
+    # Emphatically NOT `signal.signal(SIGPIPE, SIG_DFL)`. A signal disposition is
+    # process-global: it applies to every descriptor, the TLS socket included, so
+    # an EPIPE on a socket write stops being a catchable BrokenPipeError and
+    # becomes death by signal 13 with nothing printed at all — measured, exit
+    # status -13 and an empty stderr, on the one path where an explanation
+    # matters most. Catching BrokenPipeError is what the signal module's own
+    # "Note on SIGPIPE" recommends, and unlike the disposition it affects only
+    # the pipe that actually broke.
+    try:
+        args = build_parser().parse_args(argv)
+        code = args.func(args)
+        sys.stdout.flush()          # here, where the failure is still catchable
+        return code
+    except BrokenPipeError:
+        _devnull_stdout()
+        return 141                  # 128 + SIGPIPE, as a shell reports it
 
 
 if __name__ == "__main__":

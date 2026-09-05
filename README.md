@@ -41,8 +41,11 @@ Mint it in a browser, on your profile's **Personal Access Tokens** tab:
 **https://jira.slac.stanford.edu/secure/ViewProfile.jspa?selectedTab=com.atlassian.pats.pats-plugin:jira-user-personal-access-tokens**
 
 (If you are not signed in, that URL redirects you to the SLAC login page rather
-than 404-ing. Click path if you would rather navigate: avatar, top right →
-**Profile** → **Personal Access Tokens**.)
+than 404-ing — the link is live, and you land back on the tab after signing in.
+Do not read more into it than that: signed out, *every* `/secure/` URL on this
+instance 302s to `login.jsp`, invented ones included, so a redirect cannot tell a
+good link from a typo. Click path if you would rather navigate: avatar, top right
+→ **Profile** → **Personal Access Tokens**.)
 
 Set an expiry — 90 days is reasonable — and copy the value. It is shown **once**.
 

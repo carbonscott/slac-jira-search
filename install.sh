@@ -55,6 +55,46 @@ done
 
 DEST="$DEST_DIR/$SKILL_NAME"
 
+# --- is what is at DEST ours? -----------------------------------------------
+# "Ours" is either a symlink pointing anywhere inside this clone — including a
+# dangling one, since moving the skill within the repo breaks every previous
+# deployment — or a real directory whose SKILL.md declares this skill's name.
+# Acting on our own deployment must not need --force; touching a stranger's
+# must. Both install and uninstall ask this same question, so it is asked in one
+# place: a copy is the DEFAULT deployment for any destination outside your home,
+# which is exactly the shared install the README documents, and an uninstall
+# that only recognised symlinks could not remove one.
+is_ours() {
+  if [ -L "$1" ]; then
+    case "$(readlink "$1")" in "$REPO_ROOT"/*) return 0 ;; esac
+    return 1
+  fi
+  [ -d "$1" ] && [ -f "$1/SKILL.md" ] &&
+    grep -qE "^name:[[:space:]]*$SKILL_NAME[[:space:]]*$" "$1/SKILL.md"
+}
+
+# --- uninstall --------------------------------------------------------------
+# Before the symlink-or-copy decision below, deliberately: that block prints a
+# paragraph about how the deployment will be made, and on the way out nothing is
+# being deployed. Nothing after this point runs on the uninstall path.
+if [ "$UNINSTALL" -eq 1 ]; then
+  if [ ! -e "$DEST" ] && [ ! -L "$DEST" ]; then
+    echo "not deployed: $DEST"
+  elif is_ours "$DEST" || [ "$FORCE" -eq 1 ]; then
+    rm -rf "$DEST"
+    echo "removed $DEST"
+  else
+    echo "install.sh: $DEST is not ours — it is neither a link into" >&2
+    echo "            $REPO_ROOT" >&2
+    echo "            nor a directory whose SKILL.md says 'name: $SKILL_NAME'." >&2
+    echo "            re-run with --force if you are sure." >&2
+    exit 1
+  fi
+  echo "note: your token file was left in place. Remove it by hand if you"
+  echo "      meant to revoke access on this machine."
+  exit 0
+fi
+
 # --- symlink or copy? -------------------------------------------------------
 # A symlink points back into this clone. That is what you want for your own
 # ~/.claude/skills, and wrong for a shared multi-user tree: every other user
@@ -81,22 +121,6 @@ if [ -z "$MODE" ]; then
   fi
 fi
 
-if [ "$UNINSTALL" -eq 1 ]; then
-  if [ ! -e "$DEST" ] && [ ! -L "$DEST" ]; then
-    echo "not deployed: $DEST"
-  elif [ -L "$DEST" ] || [ "$FORCE" -eq 1 ]; then
-    rm -rf "$DEST"
-    echo "removed $DEST"
-  else
-    echo "install.sh: $DEST is a real directory, not our symlink." >&2
-    echo "            re-run with --force if you are sure." >&2
-    exit 1
-  fi
-  echo "note: your token file was left in place. Remove it by hand if you"
-  echo "      meant to revoke access on this machine."
-  exit 0
-fi
-
 # --- sanity: is the source actually here and intact? ------------------------
 for f in "$SRC/SKILL.md" "$SRC/scripts/jqlsearch.py" "$SRC/scripts/jira-login"; do
   [ -f "$f" ] || { echo "install.sh: missing $f — run this from the clone" >&2; exit 1; }
@@ -106,20 +130,6 @@ chmod +x "$SRC/scripts/jqlsearch.py" "$SRC/scripts/jira-login" 2>/dev/null || tr
 mkdir -p "$DEST_DIR"
 
 # --- refuse to clobber someone else's skill ---------------------------------
-# "Ours" is either a symlink pointing anywhere inside this clone — including a
-# dangling one, since moving the skill within the repo breaks every previous
-# deployment — or a real directory whose SKILL.md declares this skill's name.
-# Replacing our own deployment must not need --force; replacing a stranger's
-# must.
-is_ours() {
-  if [ -L "$1" ]; then
-    case "$(readlink "$1")" in "$REPO_ROOT"/*) return 0 ;; esac
-    return 1
-  fi
-  [ -d "$1" ] && [ -f "$1/SKILL.md" ] &&
-    grep -qE "^name:[[:space:]]*$SKILL_NAME[[:space:]]*$" "$1/SKILL.md"
-}
-
 if [ -e "$DEST" ] || [ -L "$DEST" ]; then
   if [ -L "$DEST" ] && [ "$(readlink "$DEST")" = "$SRC" ]; then
     echo "already deployed: $DEST -> $SRC"

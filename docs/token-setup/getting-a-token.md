@@ -40,9 +40,73 @@ $ curl -s -o /dev/null -w '%{http_code} %{redirect_url}\n' \
 302 https://jira.slac.stanford.edu/login.jsp?permissionViolation=true&os_destination=%2Fsecure%2FViewProfile.jspa%3FselectedTab%3Dcom.atlassian.pats.pats-plugin%3Ajira-user-personal-access-tokens&page_caps=&user_role=
 ```
 
-A `302` to `login.jsp` means the URL is right and you simply need to sign in;
-Jira carries your original destination in `os_destination`, so you land back on
-the token tab afterwards. If you get a `404`, the link was truncated.
+That tells you the site is up and the link is live rather than dead, and Jira
+carries your destination in `os_destination`, so signing in lands you back on
+the token tab.
+
+**It does not tell you the URL is correct.** Signed out, *everything* under
+`/secure/` answers `302 → login.jsp`, including URLs that do not exist. Same day,
+same cookieless `curl`:
+
+```
+/secure/ViewProfile.jspa?selectedTab=com.atlassian.pats.pats-plugin:jira-user-personal-access-tokens
+  -> 302 .../login.jsp?permissionViolation=true&os_destination=...   (the real one)
+/secure/ViewProfile.jspa?selectedTab=com.bogus.plugin:nonexistent-tab
+  -> 302 .../login.jsp?permissionViolation=true&os_destination=...   (invented tab key)
+/secure/NoSuchPage.jspa
+  -> 302 .../login.jsp?permissionViolation=true&os_destination=...   (invented page)
+/secure/TotalGarbage12345.jspa?selectedTab=lol
+  -> 302 .../login.jsp?permissionViolation=true&os_destination=...   (pure garbage)
+```
+
+Jira checks *permission* before it checks whether the page exists, so a redirect
+is its answer to anything an anonymous visitor asks for. A `302` therefore means
+"you are not signed in" and nothing more. **The only test of the tab key itself
+is to sign in and look at the page.**
+
+### The check that can actually fail
+
+The `selectedTab` key above names Atlassian's PAT plugin. Whether that plugin is
+really installed on this instance is testable, because its REST endpoint answers
+only when it exists — and, unlike `/secure/`, it distinguishes its failures:
+
+```
+$ curl -s -o /dev/null -w 'HTTP %{http_code}\n' \
+    https://jira.slac.stanford.edu/rest/pat/latest/tokens
+HTTP 401                                        # no Bearer
+
+$ curl -s -w '\nHTTP %{http_code}\n' -K <file-holding-your-Authorization-header> \
+    https://jira.slac.stanford.edu/rest/pat/latest/tokens
+[{"id":58,"name":"test",
+  "createdAt":"2026-09-04T22:35:14.728+00:00",
+  "lastAccessedAt":"2026-09-04T23:51:56.862+00:00",
+  "expiringAt":"2026-12-03T22:35:14.728+00:00"}]
+HTTP 200                                        # body first, then the code
+
+$ curl -s -o /dev/null -w 'HTTP %{http_code}\n' -K <same file> \
+    https://jira.slac.stanford.edu/rest/nosuchplugin/latest/tokens
+HTTP 302                                        # -> login.jsp, even authenticated
+```
+
+`401` without a token, `200` with one, and `302` for a plugin that does not
+exist. The `200` is the proof: the PAT plugin is installed, and the tab key in
+the URL above is that plugin's.
+
+All three commands print their code — that is the only reason any of this is
+checkable, and the middle one is the odd shape for exactly that reason: it is the
+one whose *body* you also want, so it keeps the body (no `-o /dev/null`) and lets
+`-w` put the status line after it. Copy any of the three and you get its code.
+
+Note the metadata is name, id, created, expiry and last-used only — **the
+endpoint never returns token values**, which is why it is safe to run and paste.
+
+(Put the header in a `curl` config file — `header = "Authorization: Bearer …"`,
+mode 600 — rather than on the command line, where other users on a shared host
+can read it out of the process list.)
+
+Verified 2026-09-04. This is also the answer when someone says "your link is
+broken": ask whether they were signed in, because the redirect alone cannot
+distinguish a good link from a typo'd one.
 
 The page lists any tokens you already have — name, created date, expiry date,
 and when each was last used — and each row has a **Revoke** link. Click **Create

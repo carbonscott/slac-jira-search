@@ -9,6 +9,15 @@ Numbers are `total` from `POST /rest/api/2/search` for the account that ran the
 probes. Jira filters by project permission, so your totals will differ; the
 *shapes* and the error messages will not.
 
+**Every total in this file is one snapshot of a live tracker, taken on
+2026-09-04, and it drifts while you read it.** Two runs an hour apart that day
+already disagreed: the instance total moved 54,950 -> 54,951 and
+`statusCategory = Done` moved 46,119 -> 46,126. Totals quoted here are therefore
+consistent *with each other* only to the extent the snapshot was consistent —
+where a set and its complement are shown adding up to the instance total, that
+sum is the claim being made, and it was checked. Treat every figure as an order
+of magnitude and re-measure anything you intend to state as a fact.
+
 ## Endpoints
 
 | Endpoint | Returns | Notes |
@@ -42,19 +51,19 @@ with the sibling CQL skill, where Confluence space keys are case-sensitive.)*
 
 | Field | Example | Measured |
 |---|---|---|
-| `text` | `text ~ "epixuhr"` | 165 — searches summary + description + comments + more |
+| `text` | `text ~ "epixuhr"` | 165 — a multi-field alias, wider than it looks; see below |
 | `summary` | `summary ~ "epix"` | 89 |
 | `description` | `description ~ "epix"` | 146 |
 | `comment` | `comment ~ "epix"` | 142 |
-| `environment` | `environment ~ "epix"` | 0 — field exists, unused here |
+| `environment` | `environment ~ "epix"` | 0 — the field is queryable, this word is simply not in it |
 | `project` | `project = FERMIS3DF` | 42 |
 | `key` / `issue` | `key = FERMIS3DF-43` | 1 |
 | `issuetype` | `issuetype = Bug` / `= "Sub-task"` | 12914 / 3945 |
 | `status` | `status = Open` | 1851 |
-| `statusCategory` | `statusCategory = Done` | 46119 |
+| `statusCategory` | `statusCategory = Done` | 46,126 — **read the `!=` trap under Operators** |
 | `resolution` | `resolution IS EMPTY` | 9846 (identical to `resolution = Unresolved`) |
 | `priority` | `priority = Major` | 35670 — read the warning below |
-| `assignee` | `assignee IS EMPTY` | 10078 |
+| `assignee` | `assignee IS EMPTY` | 10,068 |
 | `reporter` / `creator` | `reporter = currentUser()` | 1 |
 | `labels` | `labels = psana` | 2 |
 | `component` | `component IS NOT EMPTY` | 31570 |
@@ -87,6 +96,41 @@ Asking for "high priority issues" with `= High` silently misses almost
 everything. `priority > Medium` (41,094) spans both schemes; `priority < Medium`
 is 12,672.
 
+### `text` is an alias, and it is wider than the four fields you would guess
+
+`text` is documented as "summary, description, environment, comments". On this
+instance it covers **more than that: custom text fields too.** Measured
+2026-09-04:
+
+| Query | `total` |
+|---|---|
+| `text ~ "epixuhr"` | **165** |
+| `summary ~ "epixuhr" OR description ~ "epixuhr" OR comment ~ "epixuhr" OR environment ~ "epixuhr"` | **140** |
+| `summary ~ "epixuhr"` / `description ~` / `comment ~` / `environment ~` | 94 / 47 / 25 / 0 |
+
+Not just a bigger number — a strict superset. Fetching both result sets and
+diffing the issue keys client-side: **25 keys are in `text` and in none of the
+four; 0 keys are in the union and not in `text`.**
+
+`TIDAT-118` is one of the 25. `key = TIDAT-118 AND text ~ "epixuhr"` returns 1;
+the same clause with `summary`, `description` or `comment` returns 0. Dumping
+that issue with `--fields '*all'`, the only place `epixuhr` appears as a
+standalone word is `customfield_11321` = `"ePixUHR LCLS-II HE project"`. The
+other two occurrences are inside longer tokens — the summary reads
+`ASIC PO: ePixUHR100KHz` and an attachment is named
+`SLAC_130nm_ePixUHR100KHz_NTO_quote_2023Oct16.pdf` — and `epixuhr` does not
+match either without a wildcard, which is why the summary clause misses. A
+custom text field is therefore the only candidate left for what `text` matched
+on, consistent with `text` indexing custom fields the four named fields exclude.
+
+**So an unexplained gap between `text ~ X` and a hand-written OR of the obvious
+fields is expected, not a bug.** Use `text` to find things; drop to named fields
+only when you deliberately want to narrow to one.
+
+*(Do not compute that gap with `text ~ X AND NOT (summary ~ X OR …)`. That
+returns 0 here — negation drops EMPTY-field rows, see the trap below. Diff the
+key sets instead, which is how the 25 above were counted.)*
+
 ## Operators
 
 | Operator | Meaning | Measured caveat |
@@ -96,12 +140,89 @@ is 12,672.
 | `!~` | does not contain | Works on `summary` (54861) — **400 on `text`**: `The operator '!~' is not supported by the 'text' field.` |
 | `>` `>=` `<` `<=` | ranges | dates, numbers, priority sequence |
 | `IN` `NOT IN` | set membership | `status in (Open, "In Progress")` = 3058 |
-| `IS EMPTY` `IS NOT EMPTY` | unset / set | `assignee IS EMPTY` = 10078 |
+| `IS EMPTY` `IS NOT EMPTY` | unset / set | `assignee IS EMPTY` = 10,068. **The only way to see EMPTY rows — `!=` cannot** |
 | `WAS` | historical value | `status WAS "In Progress"` = 16680 |
 | `CHANGED` | field ever changed | `status CHANGED` = 49575; `status CHANGED FROM "Open" TO "In Progress"` = 8379 |
 
 `NOT project = FERMIS3DF` (54908) and parentheses both work:
 `summary ~ "epix" AND (status = Open OR statusCategory = "To Do")` = 13.
+
+### `!=`, `NOT IN` and `NOT` silently drop EMPTY — the worst trap here
+
+**`field != value` does not mean "everything that isn't value". It means
+"everything that has a value, and that value isn't it."** Issues where the field
+is EMPTY are excluded, exactly as in SQL. There is no error and no warning: you
+get a smaller, plausible-looking answer.
+
+`statusCategory != Done` is the natural way to write "still open", and it is
+wrong on this instance. Measured 2026-09-04, one account, four queries:
+
+| Query | `total` |
+|---|---|
+| `statusCategory = Done` | 46,126 |
+| `statusCategory != Done` | 8,801 |
+| `statusCategory is EMPTY` | **24 — invisible to both of the above** |
+| `order by created DESC` (whole instance) | 54,951 |
+
+46,126 + 8,801 + 24 = 54,951. The arithmetic closes exactly on the instance
+total, which is the proof: the 24 are in neither the `=` set nor the `!=` set.
+They are all in project `ECSENG`, with status `In QA`, whose statusCategory is
+`No Category` — a real workflow state that belongs to no category.
+
+`NOT IN` behaves identically — `statusCategory not in (Done)` is also **8,801**.
+
+**The remedy is an explicit `or … is EMPTY`:**
+
+```
+statusCategory != Done OR statusCategory is EMPTY        -> 8,825   (8,801 + 24)
+statusCategory not in (Done) OR statusCategory is EMPTY  -> 8,825
+```
+
+**This is a property of the operator, not of `statusCategory`.** Any nullable
+field does it — `assignee !=`, `component !=`, `fixVersion !=`, `resolution !=`,
+`priority !=`. Same proof on `assignee`, same instance, same day:
+
+| Query | `total` |
+|---|---|
+| `assignee = currentUser()` | 0 |
+| `assignee != currentUser()` | 44,883 |
+| `assignee is EMPTY` | 10,068 |
+| `assignee != currentUser() OR assignee is EMPTY` | **54,951** = the whole instance |
+
+Unassigned issues are 10,068 of ~55,000 here, so `assignee != someone` quietly
+discards **18%** of the tracker.
+
+**`NOT (field ~ "…")` is the same bug wearing a different hat**, and it is worse
+because negating a text match looks so innocent:
+
+```
+NOT (environment ~ "epixuhr")   ==   environment is not EMPTY AND NOT (environment ~ "epixuhr")
+```
+
+A negated `~` returns *only* issues where the field is populated. Every issue
+with an empty `environment` is dropped, silently, even though "does not contain
+epixuhr" is obviously true of all of them — so the answer is not "the instance
+minus the matches", it is "the populated rows minus the matches". The gap between
+those two is exactly the number of issues where the field is EMPTY, and nothing
+in the response tells you that number is not zero. Do not use a negated `~` to
+compute a set difference; compare key sets client-side, or add the
+`OR field is EMPTY` arm, exactly as for `!=` above.
+
+*(This section used to quote `environment is EMPTY` and `environment is not
+EMPTY` totals as its proof. They were withdrawn: unlike the `statusCategory` and
+`assignee` triples above, the two did not add up to the instance total — they
+were short by 2,224 — so at least one of them was misrecorded, and the instance
+was unreachable when that was found. The mechanism is the same one already
+proved twice above on numbers that do close; no replacement figures have been
+invented. Re-measure the pair yourself if you want them back.)*
+
+For "still open", prefer `resolution = Unresolved` (or `resolution is EMPTY`) —
+resolution is the field whose emptiness *is* the meaning, so it has no blind
+spot.
+
+*(Numbers drift: this is a live tracker, and these four moved by single digits
+between two runs an hour apart. Re-measure before quoting them; the arithmetic
+identity is the stable part, not the totals.)*
 
 **`WAS` will not take `currentUser()`** here: `assignee WAS currentUser()` →
 400 `A value provided by the function 'currentUser' is invalid for the field 'assignee'.`
@@ -114,7 +235,7 @@ Verified working on this instance:
 |---|---|
 | `currentUser()` | `assignee = currentUser()` 0, `reporter = currentUser()` 1 |
 | `startOfDay()` `startOfWeek()` `startOfMonth()` `startOfYear()` | `created >` 21 / 147 / 119 / 6111 |
-| `endOfDay()` `endOfMonth("-1M")` `endOfWeek()` | `updated < endOfDay()` 54950; `updated > endOfMonth("-1M")` 396 |
+| `endOfDay()` `endOfMonth("-1M")` `endOfWeek()` | `updated < endOfDay()` = the whole instance (every issue was updated before the end of today); `updated > endOfMonth("-1M")` 396 |
 | `now()` | `created > now()` 0 |
 | `membersOf("group")` | `assignee in membersOf("jira-users")` 42055 |
 | `issueHistory()` `watchedIssues()` `linkedIssues("KEY")` | 0 / 1 / 0 |
@@ -226,13 +347,14 @@ Markdown; `expand=renderedFields` converts to HTML if you need it.
 
 | Query | `total` |
 |---|---|
-| `order by created DESC` (whole instance) | 54,950 |
+| `order by created DESC` (whole instance) | 54,951 |
 | projects visible to this token | 195 |
 | `issuetype = Bug` | 12,914 |
 | `issuetype IN (Bug, Task, Story)` | 34,432 |
 | `issuetype = "Sub-task"` | 3,945 |
 | `resolution IS EMPTY` (unresolved) | 9,846 |
-| `statusCategory = Done` | 46,119 |
+| `statusCategory = Done` | 46,126 |
+| `statusCategory != Done` | 8,801 — **plus 24 EMPTY it cannot see** |
 | `status = Open` | 1,851 |
 | `component IS NOT EMPTY` | 31,570 |
 | `attachments IS NOT EMPTY` | 11,898 |
@@ -242,5 +364,10 @@ Markdown; `expand=renderedFields` converts to HTML if you need it.
 | `project = FERMIS3DF` | 42 |
 | `text ~ "epixuhr"` | 165 |
 | `text ~ "detector calibration"` | 86 |
+
+These are a snapshot of a live tracker. Between two runs an hour apart on
+2026-09-04 the instance total moved 54,950 -> 54,951 and `statusCategory = Done`
+46,119 -> 46,126. Quote them as orders of magnitude, and re-measure anything you
+intend to state as a fact.
 
 For what the CLI can do with these queries, see `SKILL.md`.
