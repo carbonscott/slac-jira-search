@@ -208,14 +208,6 @@ in the response tells you that number is not zero. Do not use a negated `~` to
 compute a set difference; compare key sets client-side, or add the
 `OR field is EMPTY` arm, exactly as for `!=` above.
 
-*(This section used to quote `environment is EMPTY` and `environment is not
-EMPTY` totals as its proof. They were withdrawn: unlike the `statusCategory` and
-`assignee` triples above, the two did not add up to the instance total — they
-were short by 2,224 — so at least one of them was misrecorded, and the instance
-was unreachable when that was found. The mechanism is the same one already
-proved twice above on numbers that do close; no replacement figures have been
-invented. Re-measure the pair yourself if you want them back.)*
-
 For "still open", prefer `resolution = Unresolved` (or `resolution is EMPTY`) —
 resolution is the field whose emptiness *is* the meaning, so it has no blind
 spot.
@@ -224,8 +216,54 @@ spot.
 between two runs an hour apart. Re-measure before quoting them; the arithmetic
 identity is the stable part, not the totals.)*
 
-**`WAS` will not take `currentUser()`** here: `assignee WAS currentUser()` →
-400 `A value provided by the function 'currentUser' is invalid for the field 'assignee'.`
+### The `environment` gap: 2,224 issues no clause on the field can reach
+
+Measured 2026-09-05, one account, six queries in a single serial burst. This is
+the one field on this instance where the `EMPTY` / `not EMPTY` pair does **not**
+add up to the tracker:
+
+| Query | `total` |
+|---|---|
+| `environment is EMPTY` | 51,221 |
+| `environment is not EMPTY` | 1,508 |
+| `environment is EMPTY OR environment is not EMPTY` | 52,729 |
+| `NOT (environment is EMPTY OR environment is not EMPTY)` | 0 |
+| `order by created DESC` (whole instance) | **54,953** |
+| `environment !~ "zzzznonexistent"` (control) | 1,508 |
+
+The arithmetic closes twice and then fails once, which is the whole point:
+
+- `51,221 + 1,508 = 52,729` — the two arms partition their union exactly.
+- `1,508` again on the last row. That control is the identity at the top of this
+  section measured instead of asserted: `environment !~ "<a word that is not
+  there>"` returns the populated rows, not the instance.
+- `52,729` is **2,224 short of the instance total**, and the complement of the
+  union is `0`, not 2,224. So those 2,224 issues are not merely EMPTY — they are
+  unreachable by *any* clause on `environment`, a negated one included. They do
+  exist and they are searchable: a clause that must be true of every issue,
+  `created > "1970-01-01"`, still reaches all 54,953.
+
+**Why** they are out of scope for the field is *not* established here. A
+five-project probe — `project = KEY` against
+`project = KEY AND (environment is EMPTY OR environment is not EMPTY)` — found
+gap 0 on every project it tried, so it localised none of the 2,224; a summed
+per-project gap is a lower bound on the instance gap and never equal to it.
+Field-configuration scope, issue-type scope and project-level scope all remain
+consistent with these six numbers, and this cheat sheet does not pick between
+them.
+
+The rule the numbers force does not depend on the cause: on this instance any
+clause on `environment` — `is EMPTY`, `is not EMPTY`, `~`, `!~`, negated or not
+— quietly answers about 52,729 issues rather than 54,953. Cross-checked the same
+day on a second instrument: raw `curl` to `POST /rest/api/2/search` with
+`maxResults=0` returned the same 51,221 / 1,508 / 52,729, HTTP 200 on all three.
+Re-measure in one burst if you want current figures — the identities hold
+exactly within a burst, never across two.
+
+### `WAS` will not take `currentUser()`
+
+`assignee WAS currentUser()` → 400 `A value provided by the function
+'currentUser' is invalid for the field 'assignee'.`
 
 ## Functions
 

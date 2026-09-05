@@ -69,8 +69,8 @@ write included. There is no read-only PAT to ask for. The read-only-ness of this
 skill therefore lives in `scripts/jqlsearch.py`: every call it makes is a GET,
 with one exception — Jira takes JQL in a request body, so searching is
 `POST /rest/api/2/search`, which creates nothing. Nothing here creates, edits,
-transitions, assigns, comments on, links, or deletes anything. The audit is one
-line:
+transitions, assigns, comments on, links, or deletes anything. A first look at
+that is one line:
 
 ```bash
 grep -nE 'urlopen|Request\(|data=|method=|POST|PUT|DELETE|PATCH' "$SKILL_DIR"/scripts/*
@@ -95,6 +95,63 @@ the change that would quietly give this skill the ability to write, so `data=`,
 If a fifth hit appears, or the GET builder above ever grows a `data=`, this skill
 can change Jira.
 
+### The grep is the summary; the criterion is enumerating egress sites
+
+The pattern above is wider than the obvious one and it is still **not
+sufficient**, because a grep can only look for verbs someone thought to write.
+This line writes to Jira and matches none of its eight alternatives — no
+`urlopen`, no `Request(`, no `data=`, no `method=`, no verb at all:
+
+```python
+urllib.request.build_opener().open(url, b'{}')
+```
+
+So audit the *call graph*, not the text. Every `Call` node the parser found,
+intersected with the ways this standard library can reach the network or the
+shell:
+
+```bash
+uv run --python '>=3.9' python - "$SKILL_DIR"/scripts/jqlsearch.py <<'PY'
+import ast, sys
+EGRESS = {"urllib.request.Request", "urllib.request.urlopen",
+          "urllib.request.urlretrieve", "urllib.request.build_opener",
+          "urllib.request.OpenerDirector", "http.client.HTTPSConnection",
+          "http.client.HTTPConnection", "subprocess.run", "subprocess.Popen"}
+calls = [ast.unparse(n.func) for n in ast.walk(ast.parse(open(sys.argv[1]).read()))
+         if isinstance(n, ast.Call)]
+print("egress:", sorted(set(calls) & EGRESS))
+print("opens :", sorted({c for c in calls if c.endswith(".open")}))
+PY
+```
+
+A clean audit prints exactly this, and any other line is a finding:
+
+```
+egress: ['urllib.request.Request', 'urllib.request.urlopen']
+opens : ['os.open']
+```
+
+Two entry points, both `urllib`, both accounted for in the table above. The
+`opens` line is there because `.open` is how an opener is actually fired; the
+only two here are filesystem, not network — `os.open(path, O_CREAT|O_EXCL|O_WRONLY,
+0o600)` writing the token file, and `os.open(os.devnull)` for a stdout redirect.
+`subprocess` and `http.client` never appear, and neither does any import of
+them:
+
+```bash
+grep -nE '^(import|from) ' "$SKILL_DIR"/scripts/jqlsearch.py
+```
+
+**`uv` is not optional here.** `ast.unparse` needs Python 3.9 or newer and the
+system `python3` on a SLAC login node is 3.6, where `hasattr(ast, "unparse")` is
+`False` — so run under `uv` or this check silently cannot be performed at all.
+
+To convince yourself the enumeration can fail, append that `build_opener` line
+to a **copy** and re-run: `egress` gains `urllib.request.build_opener` and
+`opens` gains `urllib.request.build_opener().open`, while the grep on that same
+line returns zero hits. That gap between the two checks is the whole reason this
+section exists.
+
 ### Never announce a missing token you have not observed
 
 **Do not tell the user to set up a token unless a command you actually ran just
@@ -114,7 +171,7 @@ uv run --script "$JQL" whoami
 Cong Wang <cwang31@slac.stanford.edu>
   instance: https://jira.slac.stanford.edu
   account:  cwang31@slac.stanford.edu (key JIRAUSER21902)
-  token:    /home/exedev/.config/jira-search/token
+  token:    ~/.config/jira-search/token
   note:     search results are filtered by your own permissions —
             another account sees a different set of projects.
   note:     a Jira PAT carries this account's FULL permissions,

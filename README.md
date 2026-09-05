@@ -186,20 +186,6 @@ symlinks, so `git pull` updates you immediately. Anywhere else it copies, and
 says why: a symlink in a shared tree points back into one person's clone, which
 everyone else usually cannot read.
 
-**For the LCLS shared opencode tree, prefer `deploy.sh` and the manifest** in
-`deploy-opencode` over this script — it also fixes group ownership and creates
-the `agents/` symlink. Manifest entry:
-
-```json
-{
-  "name": "jira-search",
-  "repo": "carbonscott/slac-jira-search",
-  "ref": "main",
-  "cron": null,
-  "central_data": null
-}
-```
-
 ---
 
 ## What is in this repo

@@ -13,3 +13,7 @@ experiments/
 # Never commit a credential. The real token lives in ~/.config/jira-search/token.
 token
 *.token
+
+# Goal-loop contracts, ledgers and claim files: orchestration scaffolding for
+# the agent campaign that maintains this repo, not part of the shareable skill.
+.goal/
