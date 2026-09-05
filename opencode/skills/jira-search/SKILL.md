@@ -95,20 +95,18 @@ the change that would quietly give this skill the ability to write, so `data=`,
 If a fifth hit appears, or the GET builder above ever grows a `data=`, this skill
 can change Jira.
 
-### The grep is the summary; the criterion is enumerating egress sites
+### Two checks, complementary blind spots, and neither is sufficient alone
 
-The pattern above is wider than the obvious one and it is still **not
-sufficient**, because a grep can only look for verbs someone thought to write.
-This line writes to Jira and matches none of its eight alternatives — no
-`urlopen`, no `Request(`, no `data=`, no `method=`, no verb at all:
+The grep above catches a body or a verb wherever it is written. What it cannot
+catch is a primitive its vocabulary never heard of — this writes to Jira and
+matches none of its eight alternatives:
 
 ```python
-urllib.request.build_opener().open(url, b'{}')
+urllib.request.build_opener().open(url, b'{}')     # control A
 ```
 
-So audit the *call graph*, not the text. Every `Call` node the parser found,
-intersected with the ways this standard library can reach the network or the
-shell:
+So also enumerate which egress primitives the file can reach at all, by parsing
+it rather than by pattern-matching it:
 
 ```bash
 uv run --python '>=3.9' python - "$SKILL_DIR"/scripts/jqlsearch.py <<'PY'
@@ -120,37 +118,100 @@ EGRESS = {"urllib.request.Request", "urllib.request.urlopen",
 calls = [ast.unparse(n.func) for n in ast.walk(ast.parse(open(sys.argv[1]).read()))
          if isinstance(n, ast.Call)]
 print("egress:", sorted(set(calls) & EGRESS))
-print("opens :", sorted({c for c in calls if c.endswith(".open")}))
+print("opens :", sorted({c for c in calls if c == "open" or c.endswith(".open")}))
 PY
 ```
 
-A clean audit prints exactly this, and any other line is a finding:
-
 ```
 egress: ['urllib.request.Request', 'urllib.request.urlopen']
-opens : ['os.open']
+opens : ['open', 'os.open']
 ```
 
-Two entry points, both `urllib`, both accounted for in the table above. The
-`opens` line is there because `.open` is how an opener is actually fired; the
-only two here are filesystem, not network — `os.open(path, O_CREAT|O_EXCL|O_WRONLY,
-0o600)` writing the token file, and `os.open(os.devnull)` for a stdout redirect.
-`subprocess` and `http.client` never appear, and neither does any import of
-them:
+Two network entry points, both `urllib`; the `open` sites are filesystem, not
+network. **But do not stop here, because this check cannot fail for a writer.**
+The two names it permits are exactly the two a write needs:
+
+```python
+req = urllib.request.Request(url, data=b'...', method="PUT")   # control B
+with urllib.request.urlopen(req) as r: ...
+```
+
+Control B prints the *same clean output above*. The grep catches control B and
+misses control A; the enumeration catches A and misses B. Run both — and for
+the property you actually care about, *every request is a GET except one POST to
+`/search`*, look at the arguments of each call site, which is where that property
+lives:
 
 ```bash
-grep -nE '^(import|from) ' "$SKILL_DIR"/scripts/jqlsearch.py
+uv run --python '>=3.9' python - "$SKILL_DIR"/scripts/jqlsearch.py <<'PY'
+import ast, sys
+SEND = ("Request", "urlopen", "urlretrieve", "build_opener", "request",
+        "HTTPConnection", "HTTPSConnection", "system", "popen", "run", "Popen")
+tree = ast.parse(open(sys.argv[1]).read())
+alias = {}                                # so `import x as y` cannot hide a name
+for n in ast.walk(tree):
+    if isinstance(n, ast.Import):
+        for a in n.names: alias[a.asname or a.name] = a.name
+    elif isinstance(n, ast.ImportFrom):
+        for a in n.names: alias[a.asname or a.name] = f"{n.module}.{a.name}"
+def canon(s):
+    h, _, r = s.partition("."); return alias.get(h, h) + ("." + r if r else "")
+for n in ast.walk(tree):
+    if isinstance(n, ast.Call) and canon(ast.unparse(n.func)).rsplit(".", 1)[-1] in SEND:
+        kw = {k.arg: ast.unparse(k.value) for k in n.keywords}
+        body = kw.get("data") or (ast.unparse(n.args[1]) if len(n.args) > 1 else None)
+        print(f"L{n.lineno:<5} {canon(ast.unparse(n.func))}")
+        print(f"        url    = {ast.unparse(n.args[0]) if n.args else '-'}")
+        print(f"        body   = {body or 'NONE'}")
+        print(f"        method = {kw.get('method', '(none -> GET)')}")
+PY
 ```
 
-**`uv` is not optional here.** `ast.unparse` needs Python 3.9 or newer and the
-system `python3` on a SLAC login node is 3.6, where `hasattr(ast, "unparse")` is
-`False` — so run under `uv` or this check silently cannot be performed at all.
+Three sites, and this is the entire network surface of the tool:
 
-To convince yourself the enumeration can fail, append that `build_opener` line
-to a **copy** and re-run: `egress` gains `urllib.request.build_opener` and
-`opens` gains `urllib.request.build_opener().open`, while the grep on that same
-line returns zero hits. That gap between the two checks is the whole reason this
-section exists.
+```
+L343   urllib.request.Request
+        url    = url
+        body   = NONE
+        method = (none -> GET)
+L364   urllib.request.Request
+        url    = f'{BASE}{API}/search'
+        body   = body
+        method = 'POST'
+L409   urllib.request.urlopen
+        url    = req
+        body   = NONE
+        method = (none -> GET)
+```
+
+One body, one verb, and the verb is `POST` to `/search`, which creates nothing.
+Add a `PUT` anywhere and a fourth block appears carrying `method = 'PUT'` and the
+URL it would write to — **this** check fails on control B, which is the whole
+reason to prefer it. The GET paths it reaches are `/myself`, `/project` and
+`/issue/{key}`; there is no `/transitions`, `/comment`, `/issueLink` or
+`/worklog` anywhere in the file.
+
+List imports by AST too, not with `grep '^import'` — that `^` misses the
+indented `import pwd` at line 48, and an import inside a function body is
+exactly where something unwanted would hide:
+
+```bash
+uv run --python '>=3.9' python - "$SKILL_DIR"/scripts/jqlsearch.py <<'PY'
+import ast, sys
+for n in ast.walk(ast.parse(open(sys.argv[1]).read())):
+    if isinstance(n, (ast.Import, ast.ImportFrom)):
+        print(n.lineno, getattr(n, "module", ""), [a.name for a in n.names])
+PY
+```
+
+**`uv` is not optional.** `ast.unparse` needs Python 3.9 or newer and the system
+`python3` on a SLAC login node is 3.6, where `hasattr(ast, "unparse")` is
+`False` — so run these under `uv` or they silently cannot be performed at all.
+
+None of this constrains what a *token* can do. It constrains what this code
+does with one. Anything that resolves a name at runtime — `getattr`, `eval`,
+`importlib` — would defeat all three checks, so the real guarantee is that this
+file is 1,203 lines you can read, not that a script pronounced it safe.
 
 ### Never announce a missing token you have not observed
 
