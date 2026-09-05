@@ -95,7 +95,7 @@ the change that would quietly give this skill the ability to write, so `data=`,
 If a fifth hit appears, or the GET builder above ever grows a `data=`, this skill
 can change Jira.
 
-### Two checks, complementary blind spots, and neither is sufficient alone
+### Three checks with known blind spots, and the one bound that is real
 
 The grep above catches a body or a verb wherever it is written. What it cannot
 catch is a primitive its vocabulary never heard of — this writes to Jira and
@@ -139,8 +139,7 @@ with urllib.request.urlopen(req) as r: ...
 Control B prints the *same clean output above*. The grep catches control B and
 misses control A; the enumeration catches A and misses B. Run both — and for
 the property you actually care about, *every request is a GET except one POST to
-`/search`*, look at the arguments of each call site, which is where that property
-lives:
+`/search`*, look at the arguments of each call site, which is closer to it:
 
 ```bash
 uv run --python '>=3.9' python - "$SKILL_DIR"/scripts/jqlsearch.py <<'PY'
@@ -185,11 +184,45 @@ L409   urllib.request.urlopen
 ```
 
 One body, one verb, and the verb is `POST` to `/search`, which creates nothing.
-Add a `PUT` anywhere and a fourth block appears carrying `method = 'PUT'` and the
-URL it would write to — **this** check fails on control B, which is the whole
-reason to prefer it. The GET paths it reaches are `/myself`, `/project` and
-`/issue/{key}`; there is no `/transitions`, `/comment`, `/issueLink` or
-`/worklog` anywhere in the file.
+This check does fail on control B — whose `method="PUT"` is a literal argument at
+the construction call — and that narrow case is all it adds over the other two.
+**It does not generalise and it is not a proof.** Three writes that leave its
+output byte-identical, none of them using `getattr`, `eval` or `importlib`:
+
+- **assign after construction.** `req.data = b'...'` then `req.method = "PUT"` are
+  plain statements, not calls, so no block moves; the mutated site goes on
+  printing `body = NONE  method = (none -> GET)` for a request that will send a
+  PUT. The grep catches this one.
+- **subclass.** `class _R(urllib.request.Request)` with an overridden
+  `get_method`, sent through the `_send` that is already there, adds no call site
+  at all. Build the verb with `chr()` and **all three checks report clean** on a
+  file that sends `DELETE /rest/api/2/issue/{key}`.
+- **compute the verb.** `method=verb` prints `method = verb`, not the verb.
+
+So the thing that actually bounds this file is none of the three. It is that
+there are only four endpoints it can reach, and you can list them all:
+
+```bash
+grep -nE '\{API\}/' "$SKILL_DIR"/scripts/jqlsearch.py
+```
+
+```
+364:        req = urllib.request.Request(f"{BASE}{API}/search", data=body, method="POST",
+367:        return self._send(req, f"{API}/search", tries)
+688:        me = Client(verbose=args.verbose, token=token).get(f"{API}/myself")
+709:    me = Client(verbose=args.verbose).get(f"{API}/myself")
+721:    rows = Client(verbose=args.verbose).get(f"{API}/project")
+723:        sys.exit(f"unexpected response from {API}/project: {str(rows)[:200]}")
+959:    data = Client(verbose=args.verbose).get(f"{API}/issue/{key}", params)
+```
+
+
+`/search` is the only one carrying a body or a verb; `/myself`, `/project` and
+`/issue/{key}` are GETs. There is no `/transitions`, `/comment`, `/issueLink`,
+`/worklog` or `/assignee` anywhere in the file — and writing to Jira needs one of
+those, or a verb on one of these four. Those seven lines are the audit. They are
+a smaller thing to check than any script on this page, and they do not care how
+cleverly a call site is written.
 
 List imports by AST too, not with `grep '^import'` — that `^` misses the
 indented `import pwd` at line 48, and an import inside a function body is
@@ -208,10 +241,13 @@ PY
 `python3` on a SLAC login node is 3.6, where `hasattr(ast, "unparse")` is
 `False` — so run these under `uv` or they silently cannot be performed at all.
 
-None of this constrains what a *token* can do. It constrains what this code
-does with one. Anything that resolves a name at runtime — `getattr`, `eval`,
-`importlib` — would defeat all three checks, so the real guarantee is that this
-file is 1,203 lines you can read, not that a script pronounced it safe.
+None of this constrains what a *token* can do. It constrains what this code does
+with one, and it does that on evidence you can read rather than on a script's
+verdict. Treat all three checks as regression tripwires with known blind spots —
+and note that the blind spots listed above are only the ones someone has found
+so far, which is the usual state of affairs for a static check against a
+motivated change. The guarantee is the endpoint list plus 1,203 readable lines,
+not a clean audit run.
 
 ### Never announce a missing token you have not observed
 
