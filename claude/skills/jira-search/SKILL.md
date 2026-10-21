@@ -20,7 +20,7 @@ metadata and uses only the standard library, so all three of these work. (A
 token is the one thing you do need; see **Auth** below.)
 
 ```bash
-SKILL_DIR=~/.claude/skills/jira-search                # wherever this SKILL.md lives
+SKILL_DIR="${CLAUDE_SKILL_DIR}"                       # this skill's directory, filled in for you
 source "$SKILL_DIR/env.sh"                            # puts the shared uv on PATH
 JQL="$SKILL_DIR/scripts/jqlsearch.py"                 # see below
 uv run --script "$JQL" text "detector calibration"    # preferred
@@ -39,12 +39,13 @@ declares `requires-python = ">=3.9"` and uv provisions that automatically; the
 system python on SLAC login nodes is 3.6 and cannot parse the file at all
 (`SyntaxError: future feature annotations is not defined`).
 
-`$SKILL_DIR` is the directory holding this `SKILL.md` — wherever this skill was
-deployed, usually `~/.claude/skills/jira-search`:
-
-```bash
-JQL=~/.claude/skills/jira-search/scripts/jqlsearch.py
-```
+`SKILL_DIR` above is the absolute path of the directory holding this
+`SKILL.md`. Claude Code fills it in when it loads the skill, and the shared
+opencode deployment has it written in at deploy time. If it is not an absolute
+path as you read it, use the "Base directory for this skill" path printed when
+the skill loaded. Do not guess `~/.claude/skills/jira-search`: claude-lcls keeps
+its skills under `~/.claude-lcls/skills`, and opencode under its own config
+directory.
 
 Examples below use `uv run --script`. Copy `jqlsearch.py` anywhere you like — it
 is standard-library-only and has no repo-relative dependencies.
@@ -282,14 +283,31 @@ command exits with an error mentioning the token do the following apply.
 
 ### When a command really did fail on the token
 
-Stop and tell the user to set one up themselves. The command ships in this skill
-directory, so it works even for someone who only ever received the deployed
-skill:
+Stop and tell the user to set one up themselves, in a terminal of their own. The
+command ships in this skill directory, so it works even for someone who only
+ever received the deployed skill:
 
 ```bash
-$SKILL_DIR/scripts/jira-login           # prompts, hidden, writes mode 600
-$SKILL_DIR/scripts/jira-login --force   # replace an expired or wrong token
+${CLAUDE_SKILL_DIR}/scripts/jira-login           # prompts, hidden, writes mode 600
+${CLAUDE_SKILL_DIR}/scripts/jira-login --force   # replace an expired or wrong token
 ```
+
+Hand it over with the path written out in full, exactly as it appears above,
+never as `$SKILL_DIR/...` or `~/.claude/...`. Their terminal has none of your
+shell variables, and the skill is not under `~/.claude` for everyone. (If the
+path above does not start with `/`, build it from the base-directory path, as
+described under **Running the script**.) That one path is all they need:
+`jira-login` loads the shared `uv` itself, so it works from a fresh login shell
+with no `uv` on `PATH` and no `source` line first.
+
+It prompts for the token with input hidden, so it needs a real terminal of the
+user's own, not your shell.
+
+**Inside opencode-sandbox** (your shell has `APPTAINER_NAME=opencode-sandbox.sif`):
+the sandbox hides the user's real home directory and copies the token in only
+when it starts. Tell the user to run the command in a normal S3DF terminal,
+outside the sandbox, and then quit and restart `opencode-sandbox`. The same goes
+for `--force`: a running sandbox keeps the old copy until it restarts.
 
 They mint the token first, in a browser, at
 `https://jira.slac.stanford.edu/secure/ViewProfile.jspa?selectedTab=com.atlassian.pats.pats-plugin:jira-user-personal-access-tokens`
