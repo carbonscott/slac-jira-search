@@ -63,11 +63,12 @@ PAT_URL = (f"{BASE}/secure/ViewProfile.jspa?selectedTab="
 # skill directory (SKILL.md, reference/, scripts/). Absolute, so the hint stays
 # correct after the reader cd's somewhere else.
 #
-# __file__, deliberately, and NOT sys.argv[0]: the sibling `jira-login` wrapper
-# imports this module and calls main(["login"] + argv), so under it argv[0] is
-# the wrapper. A hint built from argv[0] then reads `jira-login whoami`, and the
-# wrapper has already spent the subcommand slot on "login" — that command dies
-# with `unrecognized arguments: whoami`. So: any hint that names a SUBCOMMAND
+# __file__, deliberately, and NOT sys.argv[0]: a wrapper that imports this
+# module and calls main(["login"] + argv) — as `jira-login` did before it became
+# a bash script — leaves argv[0] naming the wrapper. A hint built from argv[0]
+# then reads `jira-login whoami`, and the wrapper has already spent the
+# subcommand slot on "login" — that command dies with `unrecognized arguments:
+# whoami`. So: any hint that names a SUBCOMMAND
 # must name jqlsearch.py, whichever entry point the user actually came in
 # through. A hint with no subcommand after it has no such constraint and is free
 # to name the friendlier wrapper — LOGIN_CMD, three lines down, is exactly that
@@ -80,6 +81,14 @@ SCRIPT = os.path.abspath(__file__) if "__file__" in globals() else "jqlsearch.py
 # with no subcommand after it, so the wrapper is the right thing to name.
 _WRAPPER = os.path.join(os.path.dirname(SCRIPT), "jira-login")
 LOGIN_CMD = _WRAPPER if os.path.exists(_WRAPPER) else f"{SCRIPT} login"
+
+# `whoami` as a command the USER pastes into their own terminal, right after
+# jira-login. That shell usually has no uv on PATH: jira-login sources env.sh
+# for itself, and that does not outlive it. So name env.sh explicitly, and wrap
+# it in `bash -c` so it also works when the login shell is tcsh or zsh.
+_ENV_SH = os.path.join(os.path.dirname(os.path.dirname(SCRIPT)), "env.sh")
+WHOAMI_CMD = (f"bash -c 'source \"{_ENV_SH}\" && \"{SCRIPT}\" whoami'"
+              if os.path.exists(_ENV_SH) else f"{SCRIPT} whoami")
 
 
 def home_dir() -> str:
@@ -691,7 +700,8 @@ def cmd_login(args) -> int:
         print(f"\nwarning: {TOKEN_FILE} was written, but the check above failed.\n"
               f"         The token may be wrong (a truncated paste is the usual\n"
               f"         cause) — or this instance rate-limited the check; it\n"
-              f"         does that readily. Try `{SCRIPT} whoami` in a minute.",
+              f"         does that readily. Try this in a minute:\n"
+              f"           {WHOAMI_CMD}",
               file=sys.stderr)
         return 1
     print()

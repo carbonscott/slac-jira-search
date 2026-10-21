@@ -164,15 +164,24 @@ It ships inside the skill, so you run it by path, and the path depends on where
 the skill was deployed for you:
 
 ```bash
+# claude-lcls on S3DF
+~/.claude-lcls/skills/jira-search/scripts/jira-login
+
 # a personal Claude Code install
 ~/.claude/skills/jira-search/scripts/jira-login
 
-# the shared LCLS opencode install on S3DF
+# the shared LCLS opencode install on S3DF (opencode-sandbox included)
 /sdf/group/lcls/ds/dm/apps/dev/opencode/skills/jira-search/scripts/jira-login
 ```
 
-Both are the same program. If you use both tools, you still install the token
-only once — it goes to a single per-user file, not into either skill directory.
+All of them are the same program. If you use more than one tool, you still
+install the token only once — it goes to a single per-user file, not into any
+skill directory.
+
+Run it in a normal terminal. You do not need `uv` on your `PATH` or any setup
+line first: `jira-login` loads the facility's shared `uv` itself. If you use
+opencode-sandbox, run it outside the sandbox and then restart
+`opencode-sandbox`: the sandbox copies the token in only when it starts.
 
 If you would rather type a short command, link it onto your `PATH` once:
 
@@ -214,8 +223,10 @@ by accident.
 **Check who you are** at any time:
 
 ```bash
-<skill-dir>/scripts/jqlsearch.py whoami
+source <skill-dir>/env.sh && <skill-dir>/scripts/jqlsearch.py whoami
 ```
+
+(`env.sh` puts the shared `uv` on `PATH`; `jqlsearch.py` runs through it.)
 
 One Jira-specific trap: a **missing or malformed** `Authorization` header does
 not always produce a 401. Jira can answer `200` with the anonymous user's much

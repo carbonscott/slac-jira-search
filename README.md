@@ -58,12 +58,20 @@ Run `jira-login` and paste it at the prompt. It is not on your `PATH`; the path
 depends on where the skill was deployed:
 
 ```bash
-# shared opencode install on S3DF
+# claude-lcls on S3DF
+~/.claude-lcls/skills/jira-search/scripts/jira-login
+
+# shared opencode install on S3DF (opencode-sandbox included)
 /sdf/group/lcls/ds/dm/apps/dev/opencode/skills/jira-search/scripts/jira-login
 
 # your own Claude Code
 ~/.claude/skills/jira-search/scripts/jira-login
 ```
+
+Run it in a normal terminal. It needs no `uv` on your `PATH` and no setup line
+first: it loads the facility's shared `uv` itself. If you use opencode-sandbox,
+run it outside the sandbox, then restart `opencode-sandbox`, which copies the
+token in only when it starts.
 
 Input is hidden. The token is saved to `~/.config/jira-search/token` with mode
 600, and one live call confirms it works. Seeing your own name come back means
@@ -149,8 +157,10 @@ or malformed token with the *anonymous* view and HTTP 200 rather than a 401.
 Check who you are:
 
 ```bash
-<skill-dir>/scripts/jqlsearch.py whoami
+source <skill-dir>/env.sh && <skill-dir>/scripts/jqlsearch.py whoami
 ```
+
+(`env.sh` puts the shared `uv` on `PATH`; `jqlsearch.py` runs through it.)
 
 ---
 
